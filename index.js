@@ -129,3 +129,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Smart Routing Server running on port ${PORT}`);
 });
+
+// LINE FOR VERCEL
+module.exports = app;
