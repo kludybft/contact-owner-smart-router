@@ -116,7 +116,7 @@ app.post("/aircall/route", async (req, res) => {
 
     return res.status(200).json({
       target_type: "user", // Aircall wants the type separate
-      target_id: aircallUserId, // Aircall wants the ID separate
+      target_id: parseInt(aircallUserId), // Aircall wants the ID separate
     });
   } catch (error) {
     // F. SAFETY NET
