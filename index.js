@@ -115,7 +115,8 @@ app.post("/aircall/route", async (req, res) => {
     console.log(`✅ Success! Routing to Aircall User ID: ${aircallUserId}`);
 
     return res.status(200).json({
-      transfer_to: `user:${aircallUserId}`,
+      target_type: "user", // Aircall wants the type separate
+      target_id: aircallUserId, // Aircall wants the ID separate
     });
   } catch (error) {
     // F. SAFETY NET
