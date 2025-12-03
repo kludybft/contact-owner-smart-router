@@ -9,7 +9,6 @@ app.use(express.json());
 
 let ownerMap = {};
 
-// Initial sync of HubSpot owner → Aircall user map
 (async () => {
   try {
     logger.info("user_map_initial_build_start");
@@ -25,7 +24,6 @@ let ownerMap = {};
   }
 })();
 
-// Periodic refresh
 setInterval(async () => {
   try {
     logger.info("user_map_refresh_start");
@@ -45,47 +43,25 @@ const HUBSPOT_SEARCH_URL =
   "https://api.hubapi.com/crm/v3/objects/contacts/search";
 
 app.post("/aircall/route", async (req, res) => {
-  const { event, data } = req.body || {};
-
-  if (!data) {
-    logger.warn("aircall_payload_missing_data", { rawBody: req.body });
-    return res.status(200).json({});
-  }
-
-  const callId = data.id || null;
-  const callerNumber = data.raw_digits || null; // external caller number
-  const aircallNumber = data.number || null; // your Aircall line
-  const direction = data.direction || null;
+  const { callerNumber, callUUID } = req.body || {};
 
   logger.info("incoming_call", {
-    event,
-    callId,
     callerNumber,
-    aircallNumber,
-    direction,
+    callUUID,
+    rawBody: req.body,
   });
 
-  // Only handle newly created inbound calls; everything else falls back
-  if (event !== "call.created" || direction !== "inbound") {
-    logger.info("event_or_direction_not_handled", {
-      event,
-      direction,
-      callId,
-    });
-    return res.status(200).json({});
-  }
-
   if (!callerNumber) {
-    logger.warn("caller_number_missing", {
-      callId,
-      aircallNumber,
+    logger.warn("caller_number_missing_in_payload", {
+      callUUID,
+      rawBody: req.body,
     });
     return res.status(200).json({});
   }
 
   logger.info("hubspot_search_start", {
-    callId,
     callerNumber,
+    callUUID,
   });
 
   try {
@@ -117,15 +93,15 @@ app.post("/aircall/route", async (req, res) => {
     const results = hubspotResponse.data.results || [];
 
     logger.info("hubspot_search_complete", {
-      callId,
       callerNumber,
+      callUUID,
       resultCount: results.length,
     });
 
     if (results.length === 0) {
       logger.info("hubspot_contact_not_found_for_number", {
-        callId,
         callerNumber,
+        callUUID,
       });
       return res.status(200).json({});
     }
@@ -136,8 +112,8 @@ app.post("/aircall/route", async (req, res) => {
 
     if (!hubspotOwnerId) {
       logger.info("hubspot_contact_has_no_owner", {
-        callId,
         callerNumber,
+        callUUID,
         hubspotContactId,
       });
       return res.status(200).json({});
@@ -147,30 +123,34 @@ app.post("/aircall/route", async (req, res) => {
 
     if (!aircallUserId) {
       logger.warn("hubspot_owner_not_mapped_to_aircall_user", {
-        callId,
         callerNumber,
+        callUUID,
         hubspotContactId,
         hubspotOwnerId,
       });
       return res.status(200).json({});
     }
 
+    const targetId = parseInt(aircallUserId, 10);
+
     logger.info("call_routing_success", {
-      callId,
       callerNumber,
+      callUUID,
       hubspotContactId,
       hubspotOwnerId,
-      aircallUserId: parseInt(aircallUserId, 10),
+      aircallUserId: targetId,
     });
 
     return res.status(200).json({
-      target_type: "user",
-      target_id: parseInt(aircallUserId, 10),
+      data: {
+        target_type: "user",
+        target_id: targetId,
+      },
     });
   } catch (error) {
     logger.error("call_routing_exception", {
-      callId,
       callerNumber,
+      callUUID,
       error: error.message,
       stack: error.stack,
       hubspotStatus: error.response?.status,
