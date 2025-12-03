@@ -1,63 +1,94 @@
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
-const buildUserMap = require("./user_sync"); // Importing your new dynamic sync tool
+const buildUserMap = require("./user_sync");
+const logger = require("./logger");
 
 const app = express();
-app.use(express.json()); // Essential to parse Aircall's JSON data
+app.use(express.json());
 
-// GLOBAL VARIABLE TO STORE THE MAP
-// Format: { 'HubSpot_Owner_ID': 'Aircall_User_ID' }
 let ownerMap = {};
 
-// ==========================================
-// 1. INITIALIZE & SCHEDULE SYNC
-// ==========================================
-
-// Run immediately when server starts
+// Initial sync of HubSpot owner → Aircall user map
 (async () => {
   try {
-    console.log("🚀 Server starting... Building initial User Map.");
+    logger.info("user_map_initial_build_start");
     ownerMap = await buildUserMap();
+    logger.info("user_map_initial_build_success", {
+      ownerCount: Object.keys(ownerMap).length,
+    });
   } catch (error) {
-    console.error("❌ Critical Error: Failed to build initial map.", error);
+    logger.error("user_map_initial_build_failed", {
+      error: error.message,
+      stack: error.stack,
+    });
   }
 })();
 
-// Refresh map every 1 hour (3600000 ms)
-// This ensures new hires are added automatically without restarting the server
+// Periodic refresh
 setInterval(async () => {
-  console.log("⏰ Scheduled Task: Refreshing User Map...");
-  ownerMap = await buildUserMap();
+  try {
+    logger.info("user_map_refresh_start");
+    ownerMap = await buildUserMap();
+    logger.info("user_map_refresh_success", {
+      ownerCount: Object.keys(ownerMap).length,
+    });
+  } catch (error) {
+    logger.error("user_map_refresh_failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+  }
 }, 3600000);
 
-// ==========================================
-// 2. CONFIGURATION
-// ==========================================
 const HUBSPOT_SEARCH_URL =
   "https://api.hubapi.com/crm/v3/objects/contacts/search";
 
-// ==========================================
-// 3. MAIN ROUTE
-// ==========================================
 app.post("/aircall/route", async (req, res) => {
-  console.log("📞 Incoming call request received...");
+  const { event, data } = req.body || {};
 
-  // A. EXTRACT DATA
-  // Aircall sends the number in: req.body.data.number
-  const callerNumber = req.body.data ? req.body.data.number : null;
-
-  if (!callerNumber) {
-    console.log("❌ No number found in request. Falling back.");
-    // Return empty JSON to let Aircall follow standard routing
+  if (!data) {
+    logger.warn("aircall_payload_missing_data", { rawBody: req.body });
     return res.status(200).json({});
   }
 
-  console.log(`🔎 Searching HubSpot for: ${callerNumber}`);
+  const callId = data.id || null;
+  const callerNumber = data.raw_digits || null; // external caller number
+  const aircallNumber = data.number || null; // your Aircall line
+  const direction = data.direction || null;
+
+  logger.info("incoming_call", {
+    event,
+    callId,
+    callerNumber,
+    aircallNumber,
+    direction,
+  });
+
+  // Only handle newly created inbound calls; everything else falls back
+  if (event !== "call.created" || direction !== "inbound") {
+    logger.info("event_or_direction_not_handled", {
+      event,
+      direction,
+      callId,
+    });
+    return res.status(200).json({});
+  }
+
+  if (!callerNumber) {
+    logger.warn("caller_number_missing", {
+      callId,
+      aircallNumber,
+    });
+    return res.status(200).json({});
+  }
+
+  logger.info("hubspot_search_start", {
+    callId,
+    callerNumber,
+  });
 
   try {
-    // B. QUERY HUBSPOT API
-    // We search for the phone number to find the contact
     const hubspotResponse = await axios.post(
       HUBSPOT_SEARCH_URL,
       {
@@ -66,13 +97,13 @@ app.post("/aircall/route", async (req, res) => {
             filters: [
               {
                 propertyName: "phone",
-                operator: "CONTAINS_TOKEN", // Matches parts of numbers nicely
+                operator: "CONTAINS_TOKEN",
                 value: callerNumber,
               },
             ],
           },
         ],
-        properties: ["hubspot_owner_id"], // We only need the owner ID
+        properties: ["hubspot_owner_id"],
         limit: 1,
       },
       {
@@ -83,53 +114,76 @@ app.post("/aircall/route", async (req, res) => {
       }
     );
 
-    const results = hubspotResponse.data.results;
+    const results = hubspotResponse.data.results || [];
 
-    // C. CHECK IF CONTACT EXISTS
+    logger.info("hubspot_search_complete", {
+      callId,
+      callerNumber,
+      resultCount: results.length,
+    });
+
     if (results.length === 0) {
-      console.log("⚠️ Number not found in HubSpot.");
+      logger.info("hubspot_contact_not_found_for_number", {
+        callId,
+        callerNumber,
+      });
       return res.status(200).json({});
     }
 
     const contact = results[0];
-    const hubspotOwnerId = contact.properties.hubspot_owner_id;
+    const hubspotContactId = contact.id;
+    const hubspotOwnerId = contact.properties?.hubspot_owner_id || null;
 
     if (!hubspotOwnerId) {
-      console.log("⚠️ Contact found, but has NO owner.");
+      logger.info("hubspot_contact_has_no_owner", {
+        callId,
+        callerNumber,
+        hubspotContactId,
+      });
       return res.status(200).json({});
     }
 
-    // D. TRANSLATE ID (The Magic Step)
-    // We look up the HubSpot ID in our global 'ownerMap' variable
     const aircallUserId = ownerMap[hubspotOwnerId];
 
     if (!aircallUserId) {
-      console.log(
-        `⚠️ Owner found (HubSpot ID: ${hubspotOwnerId}), but they are not mapped to an Aircall User.`
-      );
-      console.log("Did you use the same email address in both systems?");
+      logger.warn("hubspot_owner_not_mapped_to_aircall_user", {
+        callId,
+        callerNumber,
+        hubspotContactId,
+        hubspotOwnerId,
+      });
       return res.status(200).json({});
     }
 
-    // E. SEND COMMAND TO AIRCALL
-    console.log(`✅ Success! Routing to Aircall User ID: ${aircallUserId}`);
+    logger.info("call_routing_success", {
+      callId,
+      callerNumber,
+      hubspotContactId,
+      hubspotOwnerId,
+      aircallUserId: parseInt(aircallUserId, 10),
+    });
 
     return res.status(200).json({
-      target_type: "user", // Aircall wants the type separate
-      target_id: parseInt(aircallUserId), // Aircall wants the ID separate
+      target_type: "user",
+      target_id: parseInt(aircallUserId, 10),
     });
   } catch (error) {
-    // F. SAFETY NET
-    console.error("🔥 Error processing call:", error.message);
+    logger.error("call_routing_exception", {
+      callId,
+      callerNumber,
+      error: error.message,
+      stack: error.stack,
+      hubspotStatus: error.response?.status,
+      hubspotResponse: error.response?.data,
+    });
+
     return res.status(200).json({});
   }
 });
 
-// Start Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Smart Routing Server running on port ${PORT}`);
+  logger.info("server_listening", { port: PORT });
 });
 
-// LINE FOR VERCEL
 module.exports = app;
