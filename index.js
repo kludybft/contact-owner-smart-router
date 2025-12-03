@@ -8,39 +8,26 @@ const app = express();
 app.use(express.json());
 
 let ownerMap = {};
-
-(async () => {
-  try {
-    logger.info("user_map_initial_build_start");
-    ownerMap = await buildUserMap();
-    logger.info("user_map_initial_build_success", {
-      ownerCount: Object.keys(ownerMap).length,
-    });
-  } catch (error) {
-    logger.error("user_map_initial_build_failed", {
-      error: error.message,
-      stack: error.stack,
-    });
-  }
-})();
-
-setInterval(async () => {
-  try {
-    logger.info("user_map_refresh_start");
-    ownerMap = await buildUserMap();
-    logger.info("user_map_refresh_success", {
-      ownerCount: Object.keys(ownerMap).length,
-    });
-  } catch (error) {
-    logger.error("user_map_refresh_failed", {
-      error: error.message,
-      stack: error.stack,
-    });
-  }
-}, 3600000);
-
+let lastSync = 0;
+const SYNC_INTERVAL_MS = 60 * 60 * 1000;
 const HUBSPOT_SEARCH_URL =
   "https://api.hubapi.com/crm/v3/objects/contacts/search";
+
+async function getOwnerMap() {
+  const now = Date.now();
+  const needsSync =
+    !lastSync ||
+    now - lastSync > SYNC_INTERVAL_MS ||
+    Object.keys(ownerMap).length === 0;
+
+  if (needsSync) {
+    logger.info("user_map_sync_triggered");
+    ownerMap = await buildUserMap();
+    lastSync = now;
+  }
+
+  return ownerMap;
+}
 
 app.post("/aircall/route", async (req, res) => {
   const { callerNumber, callUUID } = req.body || {};
@@ -87,6 +74,7 @@ app.post("/aircall/route", async (req, res) => {
           Authorization: `Bearer ${process.env.HUBSPOT_ACCESS_TOKEN}`,
           "Content-Type": "application/json",
         },
+        timeout: 8000,
       }
     );
 
@@ -119,7 +107,8 @@ app.post("/aircall/route", async (req, res) => {
       return res.status(200).json({});
     }
 
-    const aircallUserId = ownerMap[hubspotOwnerId];
+    const currentOwnerMap = await getOwnerMap();
+    const aircallUserId = currentOwnerMap[hubspotOwnerId];
 
     if (!aircallUserId) {
       logger.warn("hubspot_owner_not_mapped_to_aircall_user", {
@@ -151,8 +140,8 @@ app.post("/aircall/route", async (req, res) => {
     logger.error("call_routing_exception", {
       callerNumber,
       callUUID,
-      error: error.message,
-      stack: error.stack,
+      message: error.message,
+      code: error.code,
       hubspotStatus: error.response?.status,
       hubspotResponse: error.response?.data,
     });
